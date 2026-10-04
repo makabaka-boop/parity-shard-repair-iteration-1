@@ -25,6 +25,7 @@ gen, err := s.Put(ctx, "obj1", data, shardstore.AnyGen) // unconditional write
 gen, err = s.Put(ctx, "obj1", data2, gen)               // conditional write (CAS)
 data, err := s.Get(ctx, "obj1")                         // read, auto-heals one bad shard
 healed, err := s.Repair(ctx, "obj1")                    // explicit repair
+tomb, err := s.Delete(ctx, "obj1", gen)                 // conditional delete (tombstone)
 ```
 
 ## Guarantees
@@ -35,6 +36,20 @@ healed, err := s.Repair(ctx, "obj1")                    // explicit repair
   temp-file + fsync + atomic rename only after all three new shards exist with
   their final names and have been re-read from disk and digest-verified. A
   half-written generation is therefore never readable.
+- **Deletion is a published tombstone generation.** `Delete(key, expectedGen)`
+  atomically renames a tombstone manifest (a generation referencing no shards)
+  into place through the same crash-safe boundary as a write: a crash before
+  the rename leaves the old object fully readable, a crash after it exposes
+  only the deletion. Once published, `Get` reports `ErrNotFound`, `Repair` and
+  the sweeper never resurrect old shards, repairs staged against the
+  pre-delete generation are discarded by the generation check, and puts based
+  on a pre-delete generation fail with `ErrGenConflict`. The key can be
+  rewritten afterwards — the next generation is `tombstoneGen+1`, so
+  generations never regress across a delete. The deleted generation's shards
+  are reclaimed best-effort; leftovers are removed by startup recovery, which
+  keeps no shards for a tombstone (and therefore never deletes newer data on
+  its behalf). A conflicting or failed delete changes neither readable data
+  nor the on-disk file set.
 - **Read-path rebuild and heal.** `Get`/`Repair` digest-check every shard.
   Exactly one missing/corrupt shard is rebuilt from the other two, the rebuilt
   bytes themselves verified against the manifest digest, then written back
@@ -56,19 +71,28 @@ healed, err := s.Repair(ctx, "obj1")                    // explicit repair
 
 ## Fault injection (tests)
 
-`Store.SetHooks` provides two crash points used by the test suite:
+`Store.SetHooks` provides three crash points used by the test suite:
 
 - `BeforeManifestPublish` — all three gen-N shards are on disk, the manifest
   still points at the previous generation (verifies crash-before-publish +
-  restart recovery, both for first write and overwrite);
+  restart recovery, both for first write and overwrite); also fires before a
+  tombstone is published, verifying a crashed delete leaves the old object
+  readable;
+- `AfterManifestPublish` — the new manifest (data or tombstone) is published
+  but the previous generation's shards are not yet reclaimed (verifies the
+  published state is already the only visible one and recovery collects the
+  leftover shards);
 - `AfterRepairStaged` — the rebuilt shard is staged but uncommitted, allowing a
-  conditional `Put` to publish a new generation inside the repair window
-  (verifies the stale repair is dropped and new data is untouched).
+  conditional `Put` or a `Delete` to publish a new generation inside the
+  repair window (verifies the stale repair is dropped and new data — or the
+  tombstone — is untouched).
 
 Tests also cover single-volume loss/bit-rot for each shard role, two-shard
 loss, odd-length padding, 16 concurrent conditional writers with exactly one
-winner, the background sweeper, and a manually constructed mid-rename crash
-layout. Run with:
+winner, concurrent delete-vs-put with exactly one winner, delete/rewrite
+generation monotonicity, staged repairs interleaved with delete and rewrite,
+the background sweeper (including that it never resurrects a tombstoned key),
+and a manually constructed mid-rename crash layout. Run with:
 
 ```sh
 go test -race ./...

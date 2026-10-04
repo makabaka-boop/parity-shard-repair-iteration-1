@@ -13,6 +13,15 @@
 // been re-read and digest-checked, so a half-written generation can never
 // become readable. Repair never overwrites shards or the manifest of a newer
 // generation; when the manifest has advanced under it, the repair is discarded.
+//
+// Deletion is itself a published generation: Delete atomically renames a
+// tombstone manifest (a generation that references no shards) into place, so
+// the delete conclusion has exactly the same crash boundary as a write —
+// before the tombstone rename the old object is fully readable, after it only
+// the deletion is visible. The tombstone occupies the generation sequence, so
+// pre-delete conditional puts and staged repairs lose the generation race,
+// and a later rewrite of the same key continues at tombstoneGen+1: generations
+// never regress across a delete.
 package shardstore
 
 import (
@@ -74,11 +83,16 @@ type ShardInfo struct {
 
 // Manifest is the published state of an object.
 type Manifest struct {
-	Key       string       `json:"key"`
-	Gen       int64        `json:"gen"` // monotonically increasing object generation
-	Length    int          `json:"length"`
-	Shards    [3]ShardInfo `json:"shards"`
-	UpdatedAt time.Time    `json:"updated_at"`
+	Key    string       `json:"key"`
+	Gen    int64        `json:"gen"` // monotonically increasing object generation
+	Length int          `json:"length"`
+	Shards [3]ShardInfo `json:"shards"`
+	// Tombstone marks a published deletion. A tombstone references no shards;
+	// it exists to keep the generation sequence monotonic across a delete so
+	// that pre-delete puts and staged repairs lose the generation race and a
+	// later rewrite of the key starts above the tombstone's generation.
+	Tombstone bool      `json:"tombstone,omitempty"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // Hooks inject faults and observation points for tests. All callbacks are
@@ -86,11 +100,18 @@ type Manifest struct {
 // that are deliberately not protected against a real process crash:
 //
 //   - BeforeManifestPublish: after the three new shards were renamed into
-//     place and verified, but before the new manifest is published.
+//     place and verified, but before the new manifest is published. Also
+//     fires before a tombstone manifest is published by Delete.
+//   - AfterManifestPublish: after the new manifest (data or tombstone) was
+//     atomically published, but before the previous generation's shards are
+//     reclaimed. A crash here leaves the old shards as unreferenced debris
+//     for startup recovery; the published manifest is already the only
+//     visible state.
 //   - AfterRepairStaged: after the rebuilt shard of an old generation was
 //     staged to a temp file, but before repair re-takes the lock and commits.
 type Hooks struct {
 	BeforeManifestPublish func(key string, gen int64) error
+	AfterManifestPublish  func(key string, gen int64) error
 	AfterRepairStaged     func(key string, gen int64) error
 }
 
@@ -343,6 +364,11 @@ func (s *Store) publishManifest(m *Manifest) error {
 // unconditional; otherwise it proceeds only when the published generation
 // equals expectedGen. On success the new generation is returned.
 //
+// The published state the precondition is checked against may be a tombstone
+// left by Delete: the generation sequence continues across deletions, so the
+// new generation is always one above the published manifest (data or
+// tombstone) and never regresses.
+//
 // The three new shards are staged as temp files, verified, renamed into their
 // final names, re-read and digest-checked before the manifest is published.
 // Any failure (including an injected crash point) removes the unpublished
@@ -382,11 +408,14 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectedGen in
 	finalNames := [numShards]string{}
 	committedRenames := 0
 	crashed := false
+	published := false
 	defer func() {
-		if err == nil || crashed {
+		if err == nil || crashed || published {
 			// A simulated crash models process death: deferred cleanup does not
 			// run, exactly as in a real crash. Startup recovery is responsible
-			// for the debris left behind.
+			// for the debris left behind. Once the manifest is published the
+			// new shards are referenced state, not debris: they must survive
+			// whatever the post-publish hooks report.
 			return
 		}
 		// Remove shards of the failed generation that were already renamed.
@@ -495,6 +524,20 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectedGen in
 		err = perr
 		return 0, err
 	}
+	published = true
+
+	// Crash point: gen-N manifest published, previous generation's shards not
+	// yet reclaimed. The new generation is already the only readable state;
+	// the old shards are unreferenced debris that startup recovery removes.
+	if h := s.hook(); h.AfterManifestPublish != nil {
+		if herr := h.AfterManifestPublish(key, newGeneration); herr != nil {
+			err = herr
+			if errors.Is(herr, ErrInjectedCrash) {
+				crashed = true
+			}
+			return 0, err
+		}
+	}
 
 	// Publication succeeded; err stays nil so the deferred cleanup skips the
 	// new shards. Best-effort removal of the previous generation's shards.
@@ -507,6 +550,93 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectedGen in
 		}
 	}
 	return newGeneration, nil
+}
+
+// ---------------------------------------------------------------------------
+// Delete
+// ---------------------------------------------------------------------------
+
+// Delete conditionally removes key by publishing a tombstone manifest at the
+// next generation. If expectedGen is AnyGen the delete is unconditional;
+// otherwise it proceeds only when the published generation equals expectedGen.
+// Deleting a key with no live object (no manifest at all, or an already
+// published tombstone) returns ErrNotFound. A generation conflict or a failed
+// publication changes neither the readable data nor the on-disk file set.
+//
+// The tombstone is published through the same crash-safe boundary as a data
+// manifest (temp file + fsync + atomic rename + dir fsync): a crash before
+// the rename leaves the old object fully readable, a crash after it exposes
+// only the deletion. Once the tombstone is published:
+//
+//   - Get reports ErrNotFound;
+//   - Repair and the sweeper treat the key as having nothing to heal and
+//     never resurrect old shards into a visible version;
+//   - repairs staged against the pre-delete generation are discarded by the
+//     usual generation check, and conditional puts based on a pre-delete
+//     generation fail with ErrGenConflict;
+//   - the key may be rewritten afterwards: the next Put publishes
+//     tombstoneGen+1, so generations never regress across a delete.
+//
+// The deleted generation's shards are reclaimed best-effort after publication;
+// whatever remains is unreferenced debris that startup recovery removes. A
+// tombstone references no shards, so recovery never deletes data of a newer
+// generation on its behalf.
+func (s *Store) Delete(ctx context.Context, key string, expectedGen int64) (newGen int64, err error) {
+	unlock := s.keyMu.lock(key)
+	defer unlock()
+
+	cur, err := s.currentManifest(key)
+	if err != nil {
+		return 0, err // ErrNotFound when nothing was ever published
+	}
+	if cur.Tombstone {
+		return 0, fmt.Errorf("%w: key %q already deleted at gen %d", ErrNotFound, key, cur.Gen)
+	}
+	if expectedGen != AnyGen && cur.Gen != expectedGen {
+		return 0, fmt.Errorf("%w: key %q at gen %d, expected %d", ErrGenConflict, key, cur.Gen, expectedGen)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	tombGen := cur.Gen + 1
+	tomb := &Manifest{
+		Key:       key,
+		Gen:       tombGen,
+		Tombstone: true,
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	// Crash point: tombstone not yet published; the old object is still the
+	// only visible state and remains fully readable after a restart.
+	if h := s.hook(); h.BeforeManifestPublish != nil {
+		if herr := h.BeforeManifestPublish(key, tombGen); herr != nil {
+			return 0, herr
+		}
+	}
+
+	if perr := s.publishManifest(tomb); perr != nil {
+		return 0, perr
+	}
+
+	// Crash point: tombstone published, old shards not yet reclaimed. The
+	// deletion is already the only visible conclusion; the leftover shards
+	// are unreferenced debris that startup recovery removes.
+	if h := s.hook(); h.AfterManifestPublish != nil {
+		if herr := h.AfterManifestPublish(key, tombGen); herr != nil {
+			return 0, herr
+		}
+	}
+
+	// Best-effort reclaim of the deleted generation's shards. The names are
+	// generation-scoped, so this cannot touch data of any newer generation.
+	for role := 0; role < numShards; role++ {
+		_ = os.Remove(s.shardPath(role, key, cur.Gen))
+	}
+	for _, d := range shardDirs {
+		_ = syncDir(filepath.Join(s.root, d))
+	}
+	return tombGen, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +670,9 @@ func rebuild(badRole int, x, y []byte, wantDigest string) ([]byte, error) {
 }
 
 // Get returns the object data for key, rebuilding and healing exactly one bad
-// shard if needed. Two or more bad shards return ErrUnrecoverable.
+// shard if needed. Two or more bad shards return ErrUnrecoverable. A key whose
+// published manifest is a tombstone (deleted) reports ErrNotFound, exactly
+// like a key that never existed.
 func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	unlock := s.keyMu.lock(key)
 	defer unlock()
@@ -548,6 +680,9 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	m, err := s.currentManifest(key)
 	if err != nil {
 		return nil, err
+	}
+	if m.Tombstone {
+		return nil, fmt.Errorf("%w: key %q deleted at gen %d", ErrNotFound, key, m.Gen)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -633,6 +768,10 @@ func (s *Store) healShardLocked(role int, m *Manifest, rebuilt []byte) error {
 // the same generation. A repair of an old generation is discarded rather than
 // overwriting the newer generation's shards.
 //
+// A key whose published manifest is a tombstone has nothing to heal: Repair
+// reports (false, nil) and never touches the deleted generation's leftover
+// shards, so a deleted object cannot be resurrected into a visible version.
+//
 // It returns (true, nil) when a shard was healed, (false, nil) when nothing
 // was wrong, and ErrUnrecoverable when two or more shards are bad.
 func (s *Store) Repair(ctx context.Context, key string) (healed bool, err error) {
@@ -642,6 +781,12 @@ func (s *Store) Repair(ctx context.Context, key string) (healed bool, err error)
 	if err != nil {
 		unlock()
 		return false, err
+	}
+	if m.Tombstone {
+		// Deleted: no shards are referenced, so there is nothing to rebuild
+		// and nothing that may be written back.
+		unlock()
+		return false, nil
 	}
 	if err := ctx.Err(); err != nil {
 		unlock()
@@ -773,7 +918,8 @@ func (s *Store) commitRepairLocked(role int, m *Manifest, tmpName string) error 
 	return nil
 }
 
-// Manifest returns a copy of the published manifest for key, if any.
+// Manifest returns a copy of the published manifest for key, if any. The
+// returned manifest may be a tombstone: deletion is a published generation.
 func (s *Store) Manifest(key string) (*Manifest, error) {
 	unlock := s.keyMu.lock(key)
 	defer unlock()
@@ -847,7 +993,11 @@ func (s *Store) listManifestKeys() ([]string, error) {
 //     published manifest (including half-written generations crashed before
 //     publication) are removed;
 //   - shards referenced by a published manifest are preserved, even damaged
-//     ones, so the object stays repairable.
+//     ones, so the object stays repairable;
+//   - a tombstone manifest references no shards at all, so every shard file
+//     of a deleted key is reclaimed — including debris whose generation
+//     number equals the tombstone's (e.g. a put that crashed before its
+//     manifest was published and was later superseded by the tombstone).
 func (s *Store) recoverOnStartup() error {
 	// keep[shardDir][basename] marks shard files referenced by a published
 	// manifest; those must survive recovery even when damaged.
@@ -872,6 +1022,11 @@ func (s *Store) recoverOnStartup() error {
 		m, merr := readManifestAt(filepath.Join(s.root, "meta", name))
 		if merr != nil {
 			continue // corrupt manifest: be conservative, delete nothing for it
+		}
+		if m.Tombstone {
+			// A tombstone references no shards: every shard file of this key,
+			// of any generation, is reclaimable debris.
+			continue
 		}
 		for role := 0; role < numShards; role++ {
 			keep[shardDirs[role]][fmt.Sprintf("%s.g%d", hexKey, m.Gen)] = true

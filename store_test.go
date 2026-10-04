@@ -3,10 +3,12 @@ package shardstore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -803,5 +805,620 @@ func TestSweepReportsUnrecoverableAndContinues(t *testing.T) {
 	}
 	if got := mustGet(t, s, "good"); !bytes.Equal(got, good) {
 		t.Fatal("sweep did not heal the healthy object")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// delete: tombstone generations
+// ---------------------------------------------------------------------------
+
+// shardFilesFor returns the regular files under root belonging to key (any
+// generation), relative to root.
+func shardFilesFor(t *testing.T, root, key string) []string {
+	t.Helper()
+	prefix := keyHex(key) + ".g"
+	var out []string
+	for _, rel := range listRegular(t, root) {
+		if strings.HasPrefix(filepath.Base(rel), prefix) {
+			out = append(out, rel)
+		}
+	}
+	return out
+}
+
+func TestDeleteBasicLifecycle(t *testing.T) {
+	s, dir := newTestStore(t)
+	ctx := context.Background()
+	key := "buoy-telemetry"
+	data := []byte("position=78.2N,15.6E;battery=87%")
+	gen := mustPut(t, s, key, data, AnyGen)
+
+	tombGen, err := s.Delete(ctx, key, gen)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if tombGen != gen+1 {
+		t.Fatalf("tombstone gen = %d, want %d", tombGen, gen+1)
+	}
+
+	// The delete conclusion is the only visible state.
+	if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after delete = %v, want ErrNotFound", err)
+	}
+	m, err := s.Manifest(key)
+	if err != nil {
+		t.Fatalf("tombstone manifest missing: %v", err)
+	}
+	if !m.Tombstone || m.Gen != tombGen {
+		t.Fatalf("manifest = %+v, want tombstone at gen %d", m, tombGen)
+	}
+
+	// The deleted generation's shards are reclaimed.
+	if left := shardFilesFor(t, dir, key); len(left) != 0 {
+		t.Fatalf("shard files remain after delete: %v", left)
+	}
+
+	// Repair and the background scan must not "heal" the tombstone generation
+	// or resurrect anything into visibility.
+	if healed, err := s.Repair(ctx, key); err != nil || healed {
+		t.Fatalf("Repair on tombstone: healed=%v err=%v", healed, err)
+	}
+	if err := s.Sweep(ctx); err != nil {
+		t.Fatalf("Sweep with tombstone: %v", err)
+	}
+	if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after repair+sweep = %v, want ErrNotFound", err)
+	}
+	if left := shardFilesFor(t, dir, key); len(left) != 0 {
+		t.Fatalf("repair/sweep resurrected shard files: %v", left)
+	}
+	if n := countDebris(t, dir); n != 0 {
+		t.Fatalf("%d debris files after delete", n)
+	}
+}
+
+// A generation conflict or a failed publication must change neither the
+// readable data nor the on-disk file set.
+func TestDeleteConditionalAndFailureKeepState(t *testing.T) {
+	s, dir := newTestStore(t)
+	ctx := context.Background()
+	key := "doc"
+	v1 := []byte("version-one")
+	mustPut(t, s, key, v1, AnyGen) // gen 1
+	filesBefore := listRegular(t, dir)
+
+	// Wrong preconditions: conflict, nothing changes.
+	for _, bad := range []int64{0, 2, 7} {
+		if _, err := s.Delete(ctx, key, bad); !errors.Is(err, ErrGenConflict) {
+			t.Fatalf("Delete(expectedGen=%d) = %v, want ErrGenConflict", bad, err)
+		}
+	}
+	// Deleting a key that never existed.
+	if _, err := s.Delete(ctx, "nope", AnyGen); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Delete missing key = %v, want ErrNotFound", err)
+	}
+	// A failed publication (injected) also leaves everything untouched.
+	boom := errors.New("publish boom")
+	s.SetHooks(&Hooks{BeforeManifestPublish: func(k string, g int64) error { return boom }})
+	if _, err := s.Delete(ctx, key, 1); !errors.Is(err, boom) {
+		t.Fatalf("Delete with failing publish = %v, want boom", err)
+	}
+	s.SetHooks(nil)
+
+	if got := mustGet(t, s, key); !bytes.Equal(got, v1) {
+		t.Fatal("failed deletes changed readable data")
+	}
+	if filesAfter := listRegular(t, dir); !slices.Equal(filesBefore, filesAfter) {
+		t.Fatalf("file set changed by failed deletes:\nbefore %v\nafter  %v", filesBefore, filesAfter)
+	}
+
+	// The real delete works, and a second delete reports the object as gone.
+	tombGen, err := s.Delete(ctx, key, 1)
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if _, err := s.Delete(ctx, key, AnyGen); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("re-delete = %v, want ErrNotFound", err)
+	}
+	if _, err := s.Delete(ctx, key, tombGen); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("re-delete with tombstone gen = %v, want ErrNotFound", err)
+	}
+}
+
+// The same key may be written again after a delete, but the generation must
+// not regress: the tombstone occupies the sequence.
+func TestDeleteThenRewriteMonotonicGeneration(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	key := "doc"
+	mustPut(t, s, key, []byte("v1"), AnyGen) // gen 1
+	tombGen, err := s.Delete(ctx, key, 1)    // tombstone gen 2
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+
+	// Puts based on a pre-delete generation must fail.
+	if _, err := s.Put(ctx, key, []byte("zombie"), 1); !errors.Is(err, ErrGenConflict) {
+		t.Fatalf("Put on pre-delete gen = %v, want ErrGenConflict", err)
+	}
+	// Create-only (expectedGen 0) also fails: the tombstone occupies gen 2.
+	if _, err := s.Put(ctx, key, []byte("zombie"), 0); !errors.Is(err, ErrGenConflict) {
+		t.Fatalf("Put expectedGen=0 over tombstone = %v, want ErrGenConflict", err)
+	}
+	if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("failed puts changed visibility: %v", err)
+	}
+
+	// Conditional on the tombstone generation: new object at gen 3.
+	gen3, err := s.Put(ctx, key, []byte("v3"), tombGen)
+	if err != nil {
+		t.Fatalf("Put over tombstone: %v", err)
+	}
+	if gen3 != tombGen+1 {
+		t.Fatalf("rewrite gen = %d, want %d (no regression past tombstone)", gen3, tombGen+1)
+	}
+	if got := mustGet(t, s, key); string(got) != "v3" {
+		t.Fatalf("rewritten data = %q", got)
+	}
+	// Unconditional writes continue the same monotonic sequence.
+	gen4 := mustPut(t, s, key, []byte("v4"), AnyGen)
+	if gen4 != gen3+1 {
+		t.Fatalf("gen after rewrite = %d, want %d", gen4, gen3+1)
+	}
+	// And the rewritten object can itself be deleted at its new generation.
+	if _, err := s.Delete(ctx, key, gen4); err != nil {
+		t.Fatalf("Delete of rewritten object: %v", err)
+	}
+	if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after second delete = %v, want ErrNotFound", err)
+	}
+}
+
+// Crash before the tombstone is published: the old object must survive
+// completely readable, and a retried delete succeeds.
+func TestDeleteCrashBeforeTombstonePublish(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "doc"
+	v1 := []byte("still-here")
+	gen1 := mustPut(t, s1, key, v1, AnyGen)
+
+	s1.SetHooks(&Hooks{
+		BeforeManifestPublish: func(k string, g int64) error {
+			return ErrInjectedCrash
+		},
+	})
+	if _, err := s1.Delete(ctx, key, gen1); !errors.Is(err, ErrInjectedCrash) {
+		t.Fatalf("Delete err = %v, want injected crash", err)
+	}
+
+	// Restart on the exact on-disk state: no tombstone was published.
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	t.Cleanup(s2.Close)
+	m, err := s2.Manifest(key)
+	if err != nil {
+		t.Fatalf("old manifest lost: %v", err)
+	}
+	if m.Tombstone || m.Gen != gen1 {
+		t.Fatalf("manifest = %+v, want data manifest at gen %d", m, gen1)
+	}
+	if got := mustGet(t, s2, key); !bytes.Equal(got, v1) {
+		t.Fatalf("old data = %q, want %q", got, v1)
+	}
+	if n := countDebris(t, dir); n != 0 {
+		t.Fatalf("%d debris files remain after recovery", n)
+	}
+	// A retried delete publishes the tombstone at gen 2.
+	tombGen, err := s2.Delete(ctx, key, gen1)
+	if err != nil {
+		t.Fatalf("retried Delete: %v", err)
+	}
+	if tombGen != gen1+1 {
+		t.Fatalf("tombstone gen = %d, want %d", tombGen, gen1+1)
+	}
+	if _, err := s2.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after retried delete = %v, want ErrNotFound", err)
+	}
+}
+
+// Crash after the tombstone is published but before the old shards are
+// reclaimed: only the deletion is visible; recovery collects the leftovers.
+func TestDeleteCrashAfterTombstonePublish(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "doc"
+	v1 := []byte("doomed-data")
+	gen1 := mustPut(t, s1, key, v1, AnyGen)
+
+	s1.SetHooks(&Hooks{
+		AfterManifestPublish: func(k string, g int64) error {
+			return ErrInjectedCrash
+		},
+	})
+	if _, err := s1.Delete(ctx, key, gen1); !errors.Is(err, ErrInjectedCrash) {
+		t.Fatalf("Delete err = %v, want injected crash", err)
+	}
+
+	// The tombstone rename already happened: the manifest on disk is the
+	// delete conclusion, and the not-yet-reclaimed old shards are debris.
+	m, err := readManifestAt(filepath.Join(dir, "meta", keyHex(key)+".json"))
+	if err != nil {
+		t.Fatalf("read manifest after crash: %v", err)
+	}
+	if !m.Tombstone || m.Gen != gen1+1 {
+		t.Fatalf("manifest = %+v, want tombstone at gen %d", m, gen1+1)
+	}
+	for role := 0; role < numShards; role++ {
+		if _, err := os.Stat(s1.shardPath(role, key, gen1)); err != nil {
+			t.Fatalf("old shard role %d should linger until recovery: %v", role, err)
+		}
+	}
+
+	// Restart: recovery reclaims the deleted generation's shards; the
+	// tombstone stays the only visible state.
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	t.Cleanup(s2.Close)
+	if _, err := s2.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after crash+restart = %v, want ErrNotFound", err)
+	}
+	if left := shardFilesFor(t, dir, key); len(left) != 0 {
+		t.Fatalf("deleted generation shards survived recovery: %v", left)
+	}
+	if n := countDebris(t, dir); n != 0 {
+		t.Fatalf("%d debris files remain after recovery", n)
+	}
+	// The key may be rewritten; the generation continues past the tombstone.
+	gen3 := mustPut(t, s2, key, []byte("reborn"), AnyGen)
+	if gen3 != gen1+2 {
+		t.Fatalf("rewrite gen = %d, want %d", gen3, gen1+2)
+	}
+	if got := mustGet(t, s2, key); string(got) != "reborn" {
+		t.Fatalf("rewritten data = %q", got)
+	}
+}
+
+// Crash after a data manifest is published but before the previous
+// generation's shards are reclaimed: the new generation is fully readable and
+// the old shards are collected as debris.
+func TestPutCrashAfterPublishKeepsNewGeneration(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "doc"
+	v1 := []byte("v1")
+	gen1 := mustPut(t, s1, key, v1, AnyGen)
+
+	s1.SetHooks(&Hooks{
+		AfterManifestPublish: func(k string, g int64) error {
+			if g == 2 {
+				return ErrInjectedCrash
+			}
+			return nil
+		},
+	})
+	v2 := []byte("v2-published")
+	if _, err := s1.Put(ctx, key, v2, gen1); !errors.Is(err, ErrInjectedCrash) {
+		t.Fatalf("Put err = %v, want injected crash", err)
+	}
+
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen after crash: %v", err)
+	}
+	t.Cleanup(s2.Close)
+	m, err := s2.Manifest(key)
+	if err != nil || m.Gen != 2 || m.Tombstone {
+		t.Fatalf("manifest = %+v err=%v, want data manifest at gen 2", m, err)
+	}
+	if got := mustGet(t, s2, key); !bytes.Equal(got, v2) {
+		t.Fatalf("data = %q, want %q", got, v2)
+	}
+	if left := shardFilesFor(t, dir, key); len(left) != numShards {
+		t.Fatalf("shard files after recovery = %v, want exactly gen-2 shards", left)
+	}
+	if n := countDebris(t, dir); n != 0 {
+		t.Fatalf("%d debris files remain after recovery", n)
+	}
+}
+
+// A repair staged against the pre-delete generation must be discarded when a
+// delete publishes a tombstone inside the staging window.
+func TestRepairStagedThenDeleteDiscardsRepair(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	key := "race"
+	v1 := []byte("about-to-be-deleted")
+	gen1 := mustPut(t, s, key, v1, AnyGen)
+	deleteShard(t, s, ShardA, key, gen1)
+
+	release := make(chan struct{})
+	s.SetHooks(&Hooks{
+		AfterRepairStaged: func(k string, g int64) error {
+			if g != gen1 {
+				t.Errorf("repair staging unexpected gen %d", g)
+			}
+			// While the repair holds no lock, delete the object.
+			tombGen, err := s.Delete(ctx, k, gen1)
+			if err != nil {
+				return fmt.Errorf("concurrent Delete failed: %w", err)
+			}
+			if tombGen != gen1+1 {
+				t.Errorf("concurrent Delete tombstone gen = %d, want %d", tombGen, gen1+1)
+			}
+			close(release)
+			return nil
+		},
+	})
+
+	healed, err := s.Repair(ctx, key)
+	if err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	if healed {
+		t.Fatal("stale-generation repair must not report healing over a tombstone")
+	}
+	select {
+	case <-release:
+	default:
+		t.Fatal("staging hook never ran")
+	}
+
+	if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get = %v, want ErrNotFound", err)
+	}
+	m, err := s.Manifest(key)
+	if err != nil || !m.Tombstone || m.Gen != gen1+1 {
+		t.Fatalf("manifest = %+v err=%v, want tombstone at gen %d", m, err, gen1+1)
+	}
+	// The staged repair must not have resurrected shard A of the deleted
+	// generation, and its temp file must be gone.
+	if left := shardFilesFor(t, s.root, key); len(left) != 0 {
+		t.Fatalf("deleted generation shard resurrected: %v", left)
+	}
+	if n := countDebris(t, s.root); n != 0 {
+		t.Fatalf("%d debris files after interleaving", n)
+	}
+}
+
+// A repair staged against gen 1 stays discarded even when the staging window
+// contains a full delete + rewrite cycle: the commit must not touch gen 3.
+func TestRepairStagedAcrossDeleteAndRewrite(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	key := "race"
+	v1 := []byte("gen-one-data")
+	gen1 := mustPut(t, s, key, v1, AnyGen)
+	deleteShard(t, s, ShardB, key, gen1)
+
+	s.SetHooks(&Hooks{
+		AfterRepairStaged: func(k string, g int64) error {
+			tombGen, err := s.Delete(ctx, k, gen1)
+			if err != nil {
+				return fmt.Errorf("delete in staging window: %w", err)
+			}
+			g3, err := s.Put(ctx, k, []byte("gen-three-data"), tombGen)
+			if err != nil {
+				return fmt.Errorf("rewrite in staging window: %w", err)
+			}
+			if g3 != gen1+2 {
+				t.Errorf("rewrite gen = %d, want %d", g3, gen1+2)
+			}
+			return nil
+		},
+	})
+
+	healed, err := s.Repair(ctx, key)
+	if err != nil {
+		t.Fatalf("Repair: %v", err)
+	}
+	if healed {
+		t.Fatal("stale repair reported healing across delete+rewrite")
+	}
+	if got := mustGet(t, s, key); string(got) != "gen-three-data" {
+		t.Fatal("gen-3 data damaged by stale repair")
+	}
+	m, err := s.Manifest(key)
+	if err != nil || m.Gen != gen1+2 || m.Tombstone {
+		t.Fatalf("manifest = %+v err=%v, want data manifest at gen %d", m, err, gen1+2)
+	}
+	// Only gen-3 shards plus the manifest may remain.
+	if left := shardFilesFor(t, s.root, key); len(left) != numShards {
+		t.Fatalf("unexpected shard files: %v", left)
+	}
+	if n := countDebris(t, s.root); n != 0 {
+		t.Fatalf("%d debris files after interleaving", n)
+	}
+}
+
+// Reverse window: the delete completed before Repair even starts; Repair is a
+// no-op and nothing comes back.
+func TestRepairAfterDeleteIsNoOp(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	key := "k"
+	gen1 := mustPut(t, s, key, []byte("v1"), AnyGen)
+	if _, err := s.Delete(ctx, key, gen1); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	healed, err := s.Repair(ctx, key)
+	if err != nil || healed {
+		t.Fatalf("Repair after delete: healed=%v err=%v", healed, err)
+	}
+	if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get = %v, want ErrNotFound", err)
+	}
+}
+
+// The background sweeper must neither heal nor resurrect a deleted object,
+// even while stray shards of the deleted generation still litter the disk
+// (e.g. from a crash-interrupted reclaim).
+func TestSweeperIgnoresTombstone(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, WithSweeper(10*time.Millisecond, func(format string, args ...any) {
+		t.Logf(format, args...)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "bg"
+	gen1 := mustPut(t, s, key, bytes.Repeat([]byte("p"), 40), AnyGen)
+	if _, err := s.Delete(ctx, key, gen1); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	// A stray shard of the deleted generation, as left behind by a crash
+	// between tombstone publication and reclaim.
+	stray := s.shardPath(ShardA, key, gen1)
+	if err := os.WriteFile(stray, []byte("stale-shard-bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let the sweeper run several passes.
+	time.Sleep(150 * time.Millisecond)
+	if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get = %v, want ErrNotFound", err)
+	}
+	m, err := s.Manifest(key)
+	if err != nil || !m.Tombstone {
+		t.Fatalf("manifest = %+v err=%v, want tombstone", m, err)
+	}
+	s.Close()
+
+	// Restart: recovery reclaims the stray shard; the tombstone persists.
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(s2.Close)
+	if _, err := os.Stat(stray); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stray shard of deleted generation survived recovery: %v", err)
+	}
+	if _, err := s2.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get after restart = %v, want ErrNotFound", err)
+	}
+}
+
+// A tombstone references no shards: recovery must remove shard files even when
+// their generation number equals the tombstone's — such debris arises when a
+// put crashed before publishing its manifest and a delete later published a
+// tombstone at that same generation.
+func TestRecoveryTombstoneKeepsNoShards(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "doc"
+	gen1 := mustPut(t, s1, key, []byte("v1"), AnyGen)
+
+	// Craft the post-crash layout directly: tombstone manifest at gen 2,
+	// stray shards at gen 2 (crashed put) and gen 1 (interrupted reclaim).
+	tomb := &Manifest{Key: key, Gen: gen1 + 1, Tombstone: true, UpdatedAt: time.Now().UTC()}
+	raw, err := json.Marshal(tomb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "meta", keyHex(key)+".json"), append(raw, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for role := 0; role < numShards; role++ {
+		if err := os.WriteFile(s1.shardPath(role, key, gen1+1), []byte("stray"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s2, err := New(dir)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(s2.Close)
+	if left := shardFilesFor(t, dir, key); len(left) != 0 {
+		t.Fatalf("shard files survived tombstone recovery: %v", left)
+	}
+	m, err := s2.Manifest(key)
+	if err != nil || !m.Tombstone || m.Gen != gen1+1 {
+		t.Fatalf("manifest = %+v err=%v, want tombstone at gen %d", m, err, gen1+1)
+	}
+	if _, err := s2.Get(context.Background(), key); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Get = %v, want ErrNotFound", err)
+	}
+}
+
+// A conditional put and a delete racing on the same generation: exactly one
+// wins, the loser gets a generation conflict, and the final state is
+// consistent either way.
+func TestConcurrentDeleteAndPutSingleWinner(t *testing.T) {
+	for round := 0; round < 10; round++ {
+		t.Run(fmt.Sprintf("round-%02d", round), func(t *testing.T) {
+			s, _ := newTestStore(t)
+			ctx := context.Background()
+			key := "hot"
+			mustPut(t, s, key, []byte("v1"), AnyGen) // gen 1
+
+			var wg sync.WaitGroup
+			start := make(chan struct{})
+			var putErr, delErr error
+			var putGen, delGen int64
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				<-start
+				putGen, putErr = s.Put(ctx, key, []byte("v2"), 1)
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				delGen, delErr = s.Delete(ctx, key, 1)
+			}()
+			close(start)
+			wg.Wait()
+
+			putOK, delOK := putErr == nil, delErr == nil
+			if putOK == delOK {
+				t.Fatalf("exactly one of put/delete must win: putErr=%v delErr=%v", putErr, delErr)
+			}
+			if !putOK && !errors.Is(putErr, ErrGenConflict) {
+				t.Fatalf("losing put err = %v, want ErrGenConflict", putErr)
+			}
+			if !delOK && !errors.Is(delErr, ErrGenConflict) {
+				t.Fatalf("losing delete err = %v, want ErrGenConflict", delErr)
+			}
+
+			if putOK {
+				if putGen != 2 {
+					t.Fatalf("winning put gen = %d, want 2", putGen)
+				}
+				if got := mustGet(t, s, key); string(got) != "v2" {
+					t.Fatalf("data = %q, want v2", got)
+				}
+			} else {
+				if delGen != 2 {
+					t.Fatalf("winning delete tombstone gen = %d, want 2", delGen)
+				}
+				if _, err := s.Get(ctx, key); !errors.Is(err, ErrNotFound) {
+					t.Fatalf("Get = %v, want ErrNotFound", err)
+				}
+			}
+			if n := countDebris(t, s.root); n != 0 {
+				t.Fatalf("%d debris files after race", n)
+			}
+		})
 	}
 }
