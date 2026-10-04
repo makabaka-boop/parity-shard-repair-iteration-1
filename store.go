@@ -8,11 +8,13 @@
 //	<root>/parity/<keyhex>.g<gen>  parity shard (length ceil(n/2))
 //	<root>/meta/<keyhex>.json      published manifest, rewritten atomically
 //
-// All publication is conditional on the object generation: a new manifest is
-// renamed into place only after all three new shards exist on disk and have
-// been re-read and digest-checked, so a half-written generation can never
-// become readable. Repair never overwrites shards or the manifest of a newer
-// generation; when the manifest has advanced under it, the repair is discarded.
+// All publication is conditional on the object generation: a new object
+// manifest is renamed into place only after all three new shards exist on disk
+// and have been re-read and digest-checked, so a half-written generation can
+// never become readable. A delete publishes a higher-generation tombstone
+// manifest instead of shards. Repair never overwrites shards or the manifest of
+// a newer generation, including a tombstone; when the manifest has advanced
+// under it, the repair is discarded.
 package shardstore
 
 import (
@@ -72,12 +74,15 @@ type ShardInfo struct {
 	SHA256 string `json:"sha256"` // lowercase hex digest of shard bytes
 }
 
-// Manifest is the published state of an object.
+// Manifest is the published state of an object. A manifest with Deleted set is
+// a tombstone: it records that no object is visible at Gen while preserving the
+// generation so later writes cannot roll the key backwards.
 type Manifest struct {
 	Key       string       `json:"key"`
 	Gen       int64        `json:"gen"` // monotonically increasing object generation
 	Length    int          `json:"length"`
 	Shards    [3]ShardInfo `json:"shards"`
+	Deleted   bool         `json:"deleted,omitempty"`
 	UpdatedAt time.Time    `json:"updated_at"`
 }
 
@@ -86,11 +91,16 @@ type Manifest struct {
 // that are deliberately not protected against a real process crash:
 //
 //   - BeforeManifestPublish: after the three new shards were renamed into
-//     place and verified, but before the new manifest is published.
+//     place and verified for a Put, but before the new manifest is published.
+//     For a Delete there are no shards; the hook runs immediately before the
+//     tombstone manifest is published.
+//   - AfterManifestPublish: after an object or tombstone manifest rename and
+//     directory fsync are durable, but before superseded shards are reclaimed.
 //   - AfterRepairStaged: after the rebuilt shard of an old generation was
 //     staged to a temp file, but before repair re-takes the lock and commits.
 type Hooks struct {
 	BeforeManifestPublish func(key string, gen int64) error
+	AfterManifestPublish  func(key string, gen int64, deleted bool) error
 	AfterRepairStaged     func(key string, gen int64) error
 }
 
@@ -111,7 +121,7 @@ type Store struct {
 type Option func(*Store)
 
 // WithSweeper enables a background repair loop that periodically scans every
-// published object and heals single-shard damage.
+// published live object and heals single-shard damage. Tombstones are skipped.
 func WithSweeper(interval time.Duration, logf func(format string, args ...any)) Option {
 	return func(s *Store) {
 		stop := make(chan struct{})
@@ -137,7 +147,8 @@ func WithSweeper(interval time.Duration, logf func(format string, args ...any)) 
 
 // New creates (or reopens) a store rooted at root and performs crash recovery:
 // temp files from interrupted publications and shards not referenced by a
-// published manifest are removed, while data still referenced is preserved.
+// published live manifest are removed, while data still referenced is
+// preserved. Tombstones are retained as the current generation for the key.
 func New(root string, opts ...Option) (*Store, error) {
 	s := &Store{root: root}
 	for _, d := range shardDirs {
@@ -319,6 +330,40 @@ func (s *Store) currentManifest(key string) (*Manifest, error) {
 	return readManifestAt(s.manifestPath(key))
 }
 
+func currentGen(cur *Manifest) int64 {
+	if cur == nil {
+		return 0
+	}
+	return cur.Gen
+}
+
+func nextGen(cur *Manifest) int64 {
+	return currentGen(cur) + 1
+}
+
+// checkExpectedGen is the single generation precondition used by Put and
+// Delete. A missing key has generation 0; a tombstone still has the generation
+// recorded in its manifest and therefore advances the key.
+func checkExpectedGen(key string, cur *Manifest, expectedGen int64) error {
+	if expectedGen == AnyGen || currentGen(cur) == expectedGen {
+		return nil
+	}
+	return fmt.Errorf("%w: key %q at gen %d, expected %d", ErrGenConflict, key, currentGen(cur), expectedGen)
+}
+
+// reclaimGenerationShards best-effort removes shards of a generation superseded
+// by a newly published manifest. It is called only after that publication is
+// durable, so failure here cannot change the visible result; restart cleanup
+// removes anything left behind.
+func (s *Store) reclaimGenerationShards(key string, gen int64) {
+	for role := 0; role < numShards; role++ {
+		_ = os.Remove(s.shardPath(role, key, gen))
+	}
+	for _, d := range shardDirs {
+		_ = syncDir(filepath.Join(s.root, d))
+	}
+}
+
 // publishManifest writes the manifest atomically (temp file + fsync + rename +
 // dir fsync). The shard directory renames and this manifest rename together
 // implement the conditional generation update: readers only ever see a
@@ -355,23 +400,14 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectedGen in
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return 0, err
 	}
-	if expectedGen != AnyGen {
-		curGen := int64(0)
-		if cur != nil {
-			curGen = cur.Gen
-		}
-		if curGen != expectedGen {
-			return 0, fmt.Errorf("%w: key %q at gen %d, expected %d", ErrGenConflict, key, curGen, expectedGen)
-		}
+	if err := checkExpectedGen(key, cur, expectedGen); err != nil {
+		return 0, err
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 
-	newGeneration := int64(1)
-	if cur != nil {
-		newGeneration = cur.Gen + 1
-	}
+	newGeneration := nextGen(cur)
 
 	ba, bb, bp := splitShards(data)
 	blobs := [numShards][]byte{ba, bb, bp}
@@ -382,8 +418,9 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectedGen in
 	finalNames := [numShards]string{}
 	committedRenames := 0
 	crashed := false
+	published := false
 	defer func() {
-		if err == nil || crashed {
+		if err == nil || crashed || published {
 			// A simulated crash models process death: deferred cleanup does not
 			// run, exactly as in a real crash. Startup recovery is responsible
 			// for the debris left behind.
@@ -495,18 +532,95 @@ func (s *Store) Put(ctx context.Context, key string, data []byte, expectedGen in
 		err = perr
 		return 0, err
 	}
+	published = true
 
-	// Publication succeeded; err stays nil so the deferred cleanup skips the
-	// new shards. Best-effort removal of the previous generation's shards.
-	if cur != nil {
-		for role := 0; role < numShards; role++ {
-			_ = os.Remove(s.shardPath(role, key, cur.Gen))
-		}
-		for _, d := range shardDirs {
-			_ = syncDir(filepath.Join(s.root, d))
+	// Crash/observation point after the new manifest is durable but before the
+	// previous generation's shards are reclaimed. Readers must see the new
+	// object; old shard debris is cleaned on restart.
+	if h := s.hook(); h.AfterManifestPublish != nil {
+		if herr := h.AfterManifestPublish(key, newGeneration, false); herr != nil {
+			err = herr
+			if errors.Is(herr, ErrInjectedCrash) {
+				crashed = true
+			}
+			return 0, err
 		}
 	}
+
+	// Publication succeeded; err stays nil so the deferred cleanup skips the
+	// new shards. Reclaim the data shards superseded by the new publication.
+	if cur != nil && !cur.Deleted {
+		s.reclaimGenerationShards(key, cur.Gen)
+	} else if cur != nil && cur.Deleted && cur.Gen > 0 {
+		// The tombstone has no shards; its predecessor is the deleted object.
+		s.reclaimGenerationShards(key, cur.Gen-1)
+	}
 	return newGeneration, nil
+}
+
+// ---------------------------------------------------------------------------
+// Delete
+// ---------------------------------------------------------------------------
+
+// Delete conditionally removes key by publishing a new-generation tombstone
+// manifest. If expectedGen is AnyGen the operation is unconditional; otherwise
+// it proceeds only when the currently published generation equals expectedGen.
+//
+// A tombstone is the durable deletion conclusion: Get subsequently returns
+// ErrNotFound, while Repair/Sweep never reconstruct the deleted shards and Put
+// uses a generation strictly greater than the tombstone generation. Deleting an
+// already-tombstoned key at its current generation is an idempotent no-op.
+//
+// The manifest is the publication boundary. Old shards are reclaimed only after
+// the tombstone is durable; a crash before publication leaves the old object
+// readable, while a crash afterwards leaves only the deletion conclusion.
+func (s *Store) Delete(ctx context.Context, key string, expectedGen int64) error {
+	unlock := s.keyMu.lock(key)
+	defer unlock()
+
+	cur, err := s.currentManifest(key)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	if err := checkExpectedGen(key, cur, expectedGen); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if cur == nil || cur.Deleted {
+		return nil
+	}
+
+	tombstone := &Manifest{
+		Key:       key,
+		Gen:       nextGen(cur),
+		Deleted:   true,
+		UpdatedAt: time.Now().UTC(),
+	}
+
+	// Crash point: old shards and the old manifest are still in place, and the
+	// deletion conclusion has not been published.
+	if h := s.hook(); h.BeforeManifestPublish != nil {
+		if herr := h.BeforeManifestPublish(key, tombstone.Gen); herr != nil {
+			return herr
+		}
+	}
+
+	if err := s.publishManifest(tombstone); err != nil {
+		return err
+	}
+
+	// Crash point: the tombstone is durable. Readers must see not-found even
+	// though the old generation's shard files may remain until reclaim/restart.
+	if h := s.hook(); h.AfterManifestPublish != nil {
+		if herr := h.AfterManifestPublish(key, tombstone.Gen, true); herr != nil {
+			return herr
+		}
+	}
+
+	s.reclaimGenerationShards(key, cur.Gen)
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +662,9 @@ func (s *Store) Get(ctx context.Context, key string) ([]byte, error) {
 	m, err := s.currentManifest(key)
 	if err != nil {
 		return nil, err
+	}
+	if m.Deleted {
+		return nil, fmt.Errorf("%w: key %q tombstone gen %d", ErrNotFound, key, m.Gen)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -627,11 +744,11 @@ func (s *Store) healShardLocked(role int, m *Manifest, rebuilt []byte) error {
 	return nil
 }
 
-// Repair heals one missing or corrupt shard of the published generation. It is
-// safe to run while writes are in progress: the rebuilt shard is staged while
-// no lock is held, and the commit only proceeds if the manifest still names
-// the same generation. A repair of an old generation is discarded rather than
-// overwriting the newer generation's shards.
+// Repair heals one missing or corrupt shard of the published live generation.
+// It is safe to run while writes or deletes are in progress: the rebuilt shard
+// is staged while no lock is held, and the commit only proceeds if the manifest
+// still names the same live generation. A repair of an old generation is
+// discarded rather than overwriting a newer generation's shards or a tombstone.
 //
 // It returns (true, nil) when a shard was healed, (false, nil) when nothing
 // was wrong, and ErrUnrecoverable when two or more shards are bad.
@@ -642,6 +759,10 @@ func (s *Store) Repair(ctx context.Context, key string) (healed bool, err error)
 	if err != nil {
 		unlock()
 		return false, err
+	}
+	if m.Deleted {
+		unlock()
+		return false, fmt.Errorf("%w: key %q tombstone gen %d", ErrNotFound, key, m.Gen)
 	}
 	if err := ctx.Err(); err != nil {
 		unlock()
@@ -789,8 +910,9 @@ func (s *Store) Manifest(key string) (*Manifest, error) {
 // sweeper
 // ---------------------------------------------------------------------------
 
-// Sweep scans all published objects and heals single-shard damage. Objects
-// with two bad shards are reported together; the sweep continues with the rest.
+// Sweep scans all published live objects and heals single-shard damage.
+// Tombstones are skipped, and objects with two bad shards are reported
+// together; the sweep continues with the rest.
 func (s *Store) Sweep(ctx context.Context) error {
 	keys, err := s.listManifestKeys()
 	if err != nil {
@@ -800,6 +922,10 @@ func (s *Store) Sweep(ctx context.Context) error {
 	for _, key := range keys {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		m, err := s.currentManifest(key)
+		if err != nil || m.Deleted {
+			continue
 		}
 		if _, rerr := s.Repair(ctx, key); rerr != nil {
 			if errors.Is(rerr, ErrUnrecoverable) {
@@ -844,10 +970,10 @@ func (s *Store) listManifestKeys() ([]string, error) {
 //   - temp files (.* in shard/meta dirs) left by interrupted puts or repairs
 //     are removed;
 //   - shard files whose <keyhex>.g<gen> name is not referenced by that key's
-//     published manifest (including half-written generations crashed before
-//     publication) are removed;
-//   - shards referenced by a published manifest are preserved, even damaged
-//     ones, so the object stays repairable.
+//     published live manifest (including half-written generations crashed before
+//     publication and shards left after a tombstone publication) are removed;
+//   - shards referenced by a published live manifest are preserved, even damaged
+//     ones, so the object stays repairable; a tombstone references no shards.
 func (s *Store) recoverOnStartup() error {
 	// keep[shardDir][basename] marks shard files referenced by a published
 	// manifest; those must survive recovery even when damaged.
@@ -872,6 +998,9 @@ func (s *Store) recoverOnStartup() error {
 		m, merr := readManifestAt(filepath.Join(s.root, "meta", name))
 		if merr != nil {
 			continue // corrupt manifest: be conservative, delete nothing for it
+		}
+		if m.Deleted {
+			continue // tombstone: all shard generations for this key are eligible for reclamation
 		}
 		for role := 0; role < numShards; role++ {
 			keep[shardDirs[role]][fmt.Sprintf("%s.g%d", hexKey, m.Gen)] = true
